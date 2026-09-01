@@ -94,7 +94,7 @@ async function startSession(ref, { externalId, phone, webhookUrl, isNewSession =
     logger,
     printQRInTerminal: false,
     markOnlineOnConnect: false,
-    browser: Browsers.macOS("Desktop"),
+    browser: Browsers.ubuntu("Chrome"),
     generateHighQualityLinkPreview: true,
     shouldSyncHistoryMessage: false,
     syncFullHistory: false,
@@ -104,13 +104,21 @@ async function startSession(ref, { externalId, phone, webhookUrl, isNewSession =
     status: state.creds?.registered ? "connecting" : "pairing",
     pairingCode: null,
     media: new Map(),
+    qrReceived: false,
   };
   sessions.set(ref, entry);
   saveMeta(ref, { externalId, phone, webhookUrl });
   sock.ev.on("creds.update", saveCreds);
   sock.ev.on("connection.update", async (u) => {
     if (stopped) return;
-    const { connection, lastDisconnect } = u;
+    const { connection, lastDisconnect, qr } = u;
+    
+    // Captura QR code
+    if (qr) {
+      entry.qrReceived = true;
+      logger.info({ ref }, "QR code received");
+    }
+    
     if (connection === "open") {
       entry.status = "connected";
       entry.pairingCode = null;
@@ -181,23 +189,50 @@ async function startSession(ref, { externalId, phone, webhookUrl, isNewSession =
       });
     }
   });
+  
   if (isNewSession && !state.creds?.registered && phone) {
-    setTimeout(async () => {
-      if (stopped) return;
+    // Sistema de 3 tentativas com backoff
+    let attempts = 0;
+    const maxAttempts = 3;
+    const requestPairingCode = async () => {
+      if (stopped || attempts >= maxAttempts) return;
+      
       try {
+        // Aguarda o QR code ser recebido
+        if (!entry.qrReceived) {
+          logger.info({ ref, attempts }, "Aguardando QR code...");
+          await new Promise(r => setTimeout(r, 2000));
+          if (!entry.qrReceived && attempts === 0) {
+            attempts++;
+            return requestPairingCode();
+          }
+        }
+        
+        attempts++;
+        logger.info({ ref, attempts }, "Solicitando código de pareamento");
         const code = await sock.requestPairingCode(phone.replace(/\D/g, ""));
         entry.pairingCode = code;
         await postWebhook(webhookUrl, { type: "status", externalId, status: "pairing", phone });
       } catch (e) {
-        logger.error({ e }, "pairing code failed");
-        entry.status = "error";
-        await postWebhook(webhookUrl, {
-          type: "status", externalId, status: "error",
-          error: "Não foi possível gerar o código de pareamento.",
-        });
+        logger.warn({ e, ref, attempts }, "Tentativa de pareamento falhou");
+        if (attempts < maxAttempts) {
+          await new Promise(r => setTimeout(r, 2000 * attempts)); // Backoff exponencial
+          return requestPairingCode();
+        } else {
+          logger.error({ e, ref }, "Todas as tentativas de pareamento falharam");
+          entry.status = "error";
+          await postWebhook(webhookUrl, {
+            type: "status", externalId, status: "error",
+            error: "Não foi possível gerar o código de pareamento após 3 tentativas.",
+          });
+        }
       }
-    }, 2500);
+    };
+    
+    // Aguarda QR code e então solicita código de pareamento
+    setTimeout(requestPairingCode, 3000);
   }
+  
   return entry;
 }
 
@@ -226,7 +261,8 @@ app.post("/sessions", async (req, res) => {
   try {
     const entry = await startSession(ref, { externalId, phone, webhookUrl, isNewSession: true });
     if (!entry) return res.status(503).json({ error: "server stopping" });
-    for (let i = 0; i < 20 && !entry.pairingCode && entry.status === "pairing"; i++) {
+    // Timeout aumentado para 45s para aguardar código de pareamento
+    for (let i = 0; i < 150 && !entry.pairingCode && entry.status === "pairing"; i++) {
       await new Promise((r) => setTimeout(r, 300));
     }
     res.json({ sessionRef: ref, pairingCode: entry.pairingCode, status: entry.status });
