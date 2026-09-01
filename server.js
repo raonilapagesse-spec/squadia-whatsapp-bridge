@@ -16,6 +16,7 @@ const PORT = process.env.PORT || 8080;
 const TOKEN = process.env.BRIDGE_TOKEN;
 const WEBHOOK_SECRET = process.env.BRIDGE_WEBHOOK_SECRET;
 const DATA_DIR = process.env.BRIDGE_DATA_DIR || "/data/sessions";
+const PAIRING_TTL_MS = parseInt(process.env.BRIDGE_PAIRING_TTL_MS || "150000");
 
 if (!TOKEN || !WEBHOOK_SECRET) {
   console.error("Faltam BRIDGE_TOKEN e/ou BRIDGE_WEBHOOK_SECRET.");
@@ -103,6 +104,7 @@ async function startSession(ref, { externalId, phone, webhookUrl, isNewSession =
     sock, externalId, phone, webhookUrl,
     status: state.creds?.registered ? "connecting" : "pairing",
     pairingCode: null,
+    pairingCodeExpiry: null,
     media: new Map(),
     qrReceived: false,
   };
@@ -122,6 +124,7 @@ async function startSession(ref, { externalId, phone, webhookUrl, isNewSession =
     if (connection === "open") {
       entry.status = "connected";
       entry.pairingCode = null;
+      entry.pairingCodeExpiry = null;
       await postWebhook(webhookUrl, {
         type: "status", externalId, status: "connected",
         phone: sock.user?.id?.split(":")?.[0] || phone,
@@ -212,7 +215,8 @@ async function startSession(ref, { externalId, phone, webhookUrl, isNewSession =
         logger.info({ ref, attempts }, "Solicitando código de pareamento");
         const code = await sock.requestPairingCode(phone.replace(/\D/g, ""));
         entry.pairingCode = code;
-        await postWebhook(webhookUrl, { type: "status", externalId, status: "pairing", phone });
+        entry.pairingCodeExpiry = Date.now() + PAIRING_TTL_MS;
+        await postWebhook(webhookUrl, { type: "status", externalId, status: "pairing", phone, pairingCodeExpiry: entry.pairingCodeExpiry });
       } catch (e) {
         logger.warn({ e, ref, attempts }, "Tentativa de pareamento falhou");
         if (attempts < maxAttempts) {
@@ -244,7 +248,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, sessions: sessions.size }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: 2, contract: "v2", sessions: sessions.size }));
 
 app.post("/sessions", async (req, res) => {
   if (stopped) return res.status(503).json({ error: "server stopping" });
@@ -265,11 +269,35 @@ app.post("/sessions", async (req, res) => {
     for (let i = 0; i < 150 && !entry.pairingCode && entry.status === "pairing"; i++) {
       await new Promise((r) => setTimeout(r, 300));
     }
-    res.json({ sessionRef: ref, pairingCode: entry.pairingCode, status: entry.status });
+    res.json({ sessionRef: ref, pairingCode: entry.pairingCode, pairingCodeExpiry: entry.pairingCodeExpiry, status: entry.status });
   } catch (e) {
     logger.error({ e }, "start session failed");
     res.status(500).json({ error: "não foi possível iniciar a sessão" });
   }
+});
+
+app.get("/sessions/:ref/status", async (req, res) => {
+  const entry = sessions.get(req.params.ref);
+  if (!entry) {
+    const meta = loadMeta(req.params.ref);
+    if (meta) {
+      return res.json({ status: "disconnected", phone: meta.phone, pairingCode: null });
+    }
+    return res.status(404).json({ error: "not found" });
+  }
+  
+  // Verifica se código expirou
+  if (entry.pairingCodeExpiry && Date.now() > entry.pairingCodeExpiry) {
+    entry.pairingCode = null;
+    entry.pairingCodeExpiry = null;
+  }
+  
+  res.json({
+    status: entry.status,
+    phone: entry.sock.user?.id?.split(":")?.[0] || entry.phone,
+    pairingCode: entry.pairingCode,
+    pairingCodeExpiry: entry.pairingCodeExpiry,
+  });
 });
 
 app.get("/sessions/:ref", async (req, res) => {
@@ -277,16 +305,22 @@ app.get("/sessions/:ref", async (req, res) => {
   if (!entry) {
     const meta = loadMeta(req.params.ref);
     if (meta) {
-      const revived = await startSession(req.params.ref, { ...meta, isNewSession: false });
-      if (!revived) return res.status(503).json({ error: "server stopping" });
-      return res.json({ status: revived.status, phone: revived.phone, pairingCode: revived.pairingCode });
+      return res.json({ status: "disconnected", phone: meta.phone, pairingCode: null });
     }
     return res.status(404).json({ error: "not found" });
   }
+  
+  // Verifica se código expirou
+  if (entry.pairingCodeExpiry && Date.now() > entry.pairingCodeExpiry) {
+    entry.pairingCode = null;
+    entry.pairingCodeExpiry = null;
+  }
+  
   res.json({
     status: entry.status,
     phone: entry.sock.user?.id?.split(":")?.[0] || entry.phone,
     pairingCode: entry.pairingCode,
+    pairingCodeExpiry: entry.pairingCodeExpiry,
   });
 });
 
@@ -357,4 +391,5 @@ if (!stopped) {
   }
 }
 
-app.listen(PORT, () => console.log(`SquadIA WhatsApp bridge on :${PORT}`));
+console.log("🚀 SquadIA WhatsApp bridge - Contrato v2");
+app.listen(PORT, () => console.log(`✓ Bridge listening on :${PORT}`));
