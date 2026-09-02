@@ -50,13 +50,32 @@ app.use(express.json({ limit: "10mb" }));
 const sessions = new Map();
 /** sessionRef -> Promise — trava de concorrência do pareamento. */
 const pairingLocks = new Map();
+const SESSION_REF_RE = /^u_[a-zA-Z0-9_-]{1,120}$/;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 300;
+const ipHits = new Map();
+const WEBHOOK_ALLOWED_HOSTS = String(process.env.BRIDGE_ALLOWED_WEBHOOK_HOSTS || "")
+  .split(",")
+  .map((h) => h.trim().toLowerCase())
+  .filter(Boolean);
 
 // ------------------------------------------------------------------
 // Persistência leve (meta.json guarda o último estado conhecido)
 // ------------------------------------------------------------------
 
+function normalizeRef(ref) {
+  const value = String(ref || "");
+  return SESSION_REF_RE.test(value) ? value : null;
+}
+
+function requiredRef(ref) {
+  const value = normalizeRef(ref);
+  if (!value) throw new Error("invalid session ref");
+  return value;
+}
+
 function sessionDir(ref) {
-  return path.join(DATA_DIR, ref);
+  return path.join(DATA_DIR, requiredRef(ref));
 }
 
 function metaPath(ref) {
@@ -101,6 +120,46 @@ function activePairingCode(meta) {
   return Date.parse(meta.pairingExpiresAt) > Date.now() ? meta.pairingCode : null;
 }
 
+function isPrivateIpv4(host) {
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return false;
+  const [a, b] = host.split(".").map(Number);
+  if (a === 10 || a === 127 || a === 0) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  return false;
+}
+
+function safeWebhookUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:") return null;
+    const host = url.hostname.toLowerCase();
+    if (!host || host === "localhost" || host === "::1" || host.endsWith(".local")) return null;
+    if (isPrivateIpv4(host)) return null;
+    if (WEBHOOK_ALLOWED_HOSTS.length > 0 && !WEBHOOK_ALLOWED_HOSTS.includes(host)) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function rateLimit(req, res, next) {
+  const source = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown");
+  const ip = source.split(",")[0].trim();
+  const now = Date.now();
+  const hit = ipHits.get(ip);
+  if (!hit || now - hit.start >= RATE_LIMIT_WINDOW_MS) {
+    ipHits.set(ip, { start: now, count: 1 });
+    return next();
+  }
+  hit.count += 1;
+  if (hit.count > RATE_LIMIT_MAX) {
+    return res.status(429).json({ error: "too many requests" });
+  }
+  next();
+}
+
 /** Visão pública do estado — só leitura, nunca com efeito colateral. */
 function publicState(ref) {
   const entry = sessions.get(ref);
@@ -131,10 +190,15 @@ function publicState(ref) {
 
 async function postWebhook(webhookUrl, event) {
   if (!webhookUrl) return;
+  const targetUrl = safeWebhookUrl(webhookUrl);
+  if (!targetUrl) {
+    logger.warn({ webhookUrl }, "unsafe webhook url rejected");
+    return;
+  }
   const raw = JSON.stringify(event);
   const signature = createHmac("sha256", WEBHOOK_SECRET).update(raw, "utf8").digest("hex");
   try {
-    await fetch(webhookUrl, {
+    await fetch(targetUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -489,12 +553,24 @@ async function requestPairing(ref, { externalId, phone, webhookUrl }) {
 }
 
 function refFor(externalId) {
-  return `u_${String(externalId).replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const compact = String(externalId).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 120);
+  return `u_${compact || "unknown"}`;
+}
+
+function readRouteRef(req, res) {
+  const ref = normalizeRef(req.params.ref);
+  if (!ref) {
+    res.status(400).json({ error: "sessionRef inválido" });
+    return null;
+  }
+  return ref;
 }
 
 // ------------------------------------------------------------------
 // HTTP
 // ------------------------------------------------------------------
+
+app.use(rateLimit);
 
 app.use((req, res, next) => {
   if (req.path === "/health") return next();
@@ -504,7 +580,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/health", (_req, res) => {
+app.get("/health", rateLimit, (_req, res) => {
   const live = [...sessions.values()];
   res.json({
     ok: true,
@@ -534,7 +610,8 @@ app.post("/sessions", async (req, res) => {
 
 /** Mesmo pareamento, endereçado pela sessão já conhecida. */
 app.post("/sessions/:ref/pair", async (req, res) => {
-  const ref = req.params.ref;
+  const ref = readRouteRef(req, res);
+  if (!ref) return;
   const meta = loadMeta(ref) || {};
   const externalId = req.body?.externalId ?? meta.externalId;
   const phone = req.body?.phone ?? meta.phone;
@@ -553,7 +630,9 @@ app.post("/sessions/:ref/pair", async (req, res) => {
 
 /** LEITURA PURA — não cria sessão, não pede código, não apaga nada. */
 function readStatus(req, res) {
-  const state = publicState(req.params.ref);
+  const ref = readRouteRef(req, res);
+  if (!ref) return;
+  const state = publicState(ref);
   if (!state) return res.status(404).json({ error: "not found" });
   res.json(state);
 }
@@ -563,7 +642,8 @@ app.get("/sessions/:ref", readStatus);
 
 /** Retoma uma sessão já registrada que não está viva (após reinício). */
 app.post("/sessions/:ref/resume", async (req, res) => {
-  const ref = req.params.ref;
+  const ref = readRouteRef(req, res);
+  if (!ref) return;
   const meta = loadMeta(ref);
   if (!meta) return res.status(404).json({ error: "not found" });
   if (sessions.has(ref)) return res.json(publicState(ref));
@@ -579,8 +659,9 @@ app.post("/sessions/:ref/resume", async (req, res) => {
   }
 });
 
-app.delete("/sessions/:ref", async (req, res) => {
-  const ref = req.params.ref;
+app.delete("/sessions/:ref", rateLimit, async (req, res) => {
+  const ref = readRouteRef(req, res);
+  if (!ref) return;
   const entry = sessions.get(ref);
   if (entry) {
     entry.stopped = true;
@@ -594,7 +675,8 @@ app.delete("/sessions/:ref", async (req, res) => {
 });
 
 app.post("/sessions/:ref/messages", async (req, res) => {
-  const ref = req.params.ref;
+  const ref = readRouteRef(req, res);
+  if (!ref) return;
   let entry = sessions.get(ref);
   // Sessão registrada porém adormecida (após reinício): retoma sob demanda.
   if (!entry && isRegistered(ref) && loadMeta(ref)) {
@@ -639,7 +721,9 @@ app.post("/sessions/:ref/messages", async (req, res) => {
 });
 
 app.get("/sessions/:ref/media/:mediaRef", async (req, res) => {
-  const entry = sessions.get(req.params.ref);
+  const ref = readRouteRef(req, res);
+  if (!ref) return;
+  const entry = sessions.get(ref);
   if (!entry) return res.status(404).json({ error: "not found" });
   const msg = entry.media.get(req.params.mediaRef);
   if (!msg) return res.status(404).json({ error: "mídia indisponível" });
@@ -673,13 +757,15 @@ app.get("/sessions/:ref/media/:mediaRef", async (req, res) => {
 // Tentativas de pareamento incompletas NÃO voltam à vida.
 // ------------------------------------------------------------------
 for (const ref of fs.existsSync(DATA_DIR) ? fs.readdirSync(DATA_DIR) : []) {
-  const meta = loadMeta(ref);
+  const safeRef = normalizeRef(ref);
+  if (!safeRef) continue;
+  const meta = loadMeta(safeRef);
   if (!meta) continue;
-  if (!isRegistered(ref)) {
-    saveMeta(ref, { status: "disconnected", pairingCode: null, pairingExpiresAt: null });
+  if (!isRegistered(safeRef)) {
+    saveMeta(safeRef, { status: "disconnected", pairingCode: null, pairingExpiresAt: null });
     continue;
   }
-  openSocket(ref, meta, "resume").catch((e) => logger.error({ e }, `revive ${ref} failed`));
+  openSocket(safeRef, meta, "resume").catch((e) => logger.error({ e }, `revive ${safeRef} failed`));
 }
 
 app.listen(PORT, () => console.log(`SquadIA WhatsApp bridge v3 on :${PORT}`));
