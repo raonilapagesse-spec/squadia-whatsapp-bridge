@@ -60,6 +60,8 @@ const SESSION_REF_RE = /^u_[a-zA-Z0-9_-]{1,120}$/;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX = 300;
 const ipHits = new Map();
+const knownSessionRefs = new Set();
+const registeredSessionRefs = new Set();
 const WEBHOOK_ALLOWED_HOSTS = String(process.env.BRIDGE_ALLOWED_WEBHOOK_HOSTS || "")
   .split(",")
   .map((h) => h.trim().toLowerCase())
@@ -78,6 +80,16 @@ function requiredRef(ref) {
   const value = normalizeRef(ref);
   if (!value) throw new Error("invalid session ref");
   return value;
+}
+
+function refreshSessionDiskState(ref) {
+  const safeRef = normalizeRef(ref);
+  if (!safeRef) return;
+  const exists = fs.existsSync(sessionDir(safeRef));
+  if (exists) knownSessionRefs.add(safeRef);
+  else knownSessionRefs.delete(safeRef);
+  if (exists && isRegistered(safeRef)) registeredSessionRefs.add(safeRef);
+  else registeredSessionRefs.delete(safeRef);
 }
 
 function sessionDir(ref) {
@@ -101,6 +113,7 @@ function saveMeta(ref, patch) {
   const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
   fs.mkdirSync(sessionDir(ref), { recursive: true });
   fs.writeFileSync(metaPath(ref), JSON.stringify(next));
+  refreshSessionDiskState(ref);
   return next;
 }
 
@@ -119,6 +132,7 @@ function wipeCredentials(ref) {
     if (file === "meta.json") continue;
     fs.rmSync(path.join(dir, file), { recursive: true, force: true });
   }
+  refreshSessionDiskState(ref);
 }
 
 function activePairingCode(meta) {
@@ -351,7 +365,10 @@ async function openSocket(ref, { externalId, phone, webhookUrl }, mode) {
   sessions.set(ref, entry);
   saveMeta(ref, { externalId, phone, webhookUrl, status: entry.status });
 
-  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("creds.update", async () => {
+    await saveCreds();
+    refreshSessionDiskState(ref);
+  });
 
   sock.ev.on("connection.update", async (u) => {
     if (entry.stopped || sessions.get(ref) !== entry) return;
@@ -616,18 +633,17 @@ app.use((req, res, next) => {
 
 app.get("/health", rateLimit, (_req, res) => {
   const live = [...sessions.values()];
-  const known = fs.existsSync(DATA_DIR) ? fs.readdirSync(DATA_DIR) : [];
   res.json({
     ok: true,
     version: 4,
     build: BUILD_ID,
     dataDir: DATA_DIR,
-    persistent: fs.existsSync(DATA_DIR),
+    persistent: true,
     sessions: live.length,
     connected: live.filter((s) => s.status === "connected").length,
     pairing: live.filter((s) => s.status === "pairing").length,
-    known: known.length,
-    registeredSessions: known.filter((ref) => isRegistered(ref)).length,
+    known: knownSessionRefs.size,
+    registeredSessions: registeredSessionRefs.size,
   });
 });
 
@@ -710,6 +726,7 @@ app.delete("/sessions/:ref", rateLimit, async (req, res) => {
     sessions.delete(ref);
   }
   fs.rmSync(sessionDir(ref), { recursive: true, force: true });
+  refreshSessionDiskState(ref);
   res.json({ ok: true });
 });
 
@@ -798,6 +815,7 @@ app.get("/sessions/:ref/media/:mediaRef", async (req, res) => {
 for (const ref of fs.existsSync(DATA_DIR) ? fs.readdirSync(DATA_DIR) : []) {
   const safeRef = normalizeRef(ref);
   if (!safeRef) continue;
+  refreshSessionDiskState(safeRef);
   const meta = loadMeta(safeRef);
   if (!meta) continue;
   if (!isRegistered(safeRef)) {
