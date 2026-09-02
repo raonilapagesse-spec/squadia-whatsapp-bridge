@@ -1,7 +1,7 @@
 /**
  * SquadIA — serviço-ponte do WhatsApp pessoal (modelo Zapia).
  *
- * Contrato (v3):
+ * Contrato (v2):
  *  - LEITURA NUNCA MUDA ESTADO. `GET /sessions/:ref/status` (e `GET /sessions/:ref`)
  *    apenas leem memória/disco. Nunca abrem socket, nunca pedem código novo,
  *    nunca apagam credenciais.
@@ -34,6 +34,10 @@ const WEBHOOK_SECRET = process.env.BRIDGE_WEBHOOK_SECRET;
 const DATA_DIR = process.env.BRIDGE_DATA_DIR || "/data/sessions";
 /** Validade do código de pareamento mostrado ao usuário. */
 const PAIRING_TTL_MS = Number(process.env.BRIDGE_PAIRING_TTL_MS || 150_000);
+/** Identificador do build no ar — evita dúvida sobre qual versão está rodando. */
+const BUILD_ID = process.env.RAILWAY_GIT_COMMIT_SHA || process.env.BRIDGE_BUILD || "2026-09-02-v4";
+/** Quantas retomadas seguidas antes de declarar falha em vez de repetir "conectando". */
+const MAX_RESUME_ATTEMPTS = Number(process.env.BRIDGE_MAX_RESUME || 6);
 
 if (!TOKEN || !WEBHOOK_SECRET) {
   console.error("Faltam BRIDGE_TOKEN e/ou BRIDGE_WEBHOOK_SECRET.");
@@ -50,6 +54,8 @@ app.use(express.json({ limit: "10mb" }));
 const sessions = new Map();
 /** sessionRef -> Promise — trava de concorrência do pareamento. */
 const pairingLocks = new Map();
+/** sessionRef -> número de retomadas seguidas sem chegar a "conectado". */
+const resumeAttempts = new Map();
 const SESSION_REF_RE = /^u_[a-zA-Z0-9_-]{1,120}$/;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX = 300;
@@ -313,7 +319,8 @@ async function openSocket(ref, { externalId, phone, webhookUrl }, mode) {
   const folder = sessionDir(ref);
   const { state, saveCreds } = await useMultiFileAuthState(folder);
   const { version } = await fetchLatestBaileysVersion();
-  const registeredAlready = !!state.creds?.registered;
+  const registeredAlready = !!state.creds?.registered || isRegistered(ref);
+  if (mode !== "resume") resumeAttempts.delete(ref);
 
   const sock = makeWASocket({
     version,
@@ -352,6 +359,7 @@ async function openSocket(ref, { externalId, phone, webhookUrl }, mode) {
     if (u.qr) entry.wsReady = true;
 
     if (connection === "open") {
+      resumeAttempts.delete(ref);
       await transition(ref, {
         status: "connected",
         pairingCode: null,
@@ -369,12 +377,16 @@ async function openSocket(ref, { externalId, phone, webhookUrl }, mode) {
     const loggedOut = code === DisconnectReason.loggedOut;
     const replaced = code === DisconnectReason.connectionReplaced;
     const restartRequired = code === DisconnectReason.restartRequired;
-    const registered = !!state.creds?.registered;
+    // O `state` desta closure é o de quando o socket abriu; depois do
+    // pareamento o registro só existe no disco. Ler de lá evita jogar fora
+    // uma sessão que o aparelho já vinculou.
+    const registered = !!state.creds?.registered || isRegistered(ref);
 
     // Estado terminal: nada de ressuscitar em laço.
     if (loggedOut || replaced) {
       stopSession(ref);
       wipeCredentials(ref);
+      resumeAttempts.delete(ref);
       await transition(ref, {
         status: "disconnected",
         pairingCode: null,
@@ -391,6 +403,7 @@ async function openSocket(ref, { externalId, phone, webhookUrl }, mode) {
     if (!registered && !restartRequired) {
       stopSession(ref);
       wipeCredentials(ref);
+      resumeAttempts.delete(ref);
       await transition(ref, {
         status: "disconnected",
         pairingCode: null,
@@ -402,8 +415,29 @@ async function openSocket(ref, { externalId, phone, webhookUrl }, mode) {
     }
 
     // Queda recuperável: retoma a MESMA sessão registrada, sem novo código.
-    await transition(ref, { status: "connecting", lastError: null, lastErrorCode: null });
-    const delay = restartRequired ? 400 : 2_000;
+    // Com teto de tentativas: laço eterno de "conectando" vira falha declarada.
+    const attempt = (resumeAttempts.get(ref) || 0) + 1;
+    resumeAttempts.set(ref, attempt);
+    if (attempt > MAX_RESUME_ATTEMPTS) {
+      stopSession(ref);
+      await transition(ref, {
+        status: "error",
+        pairingCode: null,
+        pairingExpiresAt: null,
+        lastErrorCode: "resume_exhausted",
+        lastError: `A conexão caiu ${attempt - 1} vezes seguidas sem completar (código ${
+          code ?? "desconhecido"
+        }). Gere um novo código para reconectar.`,
+      });
+      return;
+    }
+
+    await transition(ref, {
+      status: "connecting",
+      lastError: null,
+      lastErrorCode: restartRequired ? "restart_required" : `close_${code ?? "unknown"}`,
+    });
+    const delay = restartRequired ? 400 : Math.min(2_000 * attempt, 20_000);
     setTimeout(() => {
       if (entry.stopped || sessions.get(ref) !== entry) return;
       entry.stopped = true;
@@ -582,13 +616,18 @@ app.use((req, res, next) => {
 
 app.get("/health", rateLimit, (_req, res) => {
   const live = [...sessions.values()];
+  const known = fs.existsSync(DATA_DIR) ? fs.readdirSync(DATA_DIR) : [];
   res.json({
     ok: true,
-    version: 3,
+    version: 4,
+    build: BUILD_ID,
+    dataDir: DATA_DIR,
+    persistent: fs.existsSync(DATA_DIR),
     sessions: live.length,
     connected: live.filter((s) => s.status === "connected").length,
     pairing: live.filter((s) => s.status === "pairing").length,
-    known: fs.existsSync(DATA_DIR) ? fs.readdirSync(DATA_DIR).length : 0,
+    known: known.length,
+    registeredSessions: known.filter((ref) => isRegistered(ref)).length,
   });
 });
 
@@ -768,4 +807,4 @@ for (const ref of fs.existsSync(DATA_DIR) ? fs.readdirSync(DATA_DIR) : []) {
   openSocket(safeRef, meta, "resume").catch((e) => logger.error({ e }, `revive ${safeRef} failed`));
 }
 
-app.listen(PORT, () => console.log(`SquadIA WhatsApp bridge v3 on :${PORT}`));
+app.listen(PORT, () => console.log(`SquadIA WhatsApp bridge v2 on :${PORT}`));

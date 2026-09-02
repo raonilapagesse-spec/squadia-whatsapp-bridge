@@ -4,12 +4,13 @@ API de integração com WhatsApp usando Baileys para pareamento e gerenciamento 
 
 ## 🚀 Features
 
-- ✅ Pareamento automático via código 6 dígitos
+- ✅ Pareamento explícito via `POST /sessions` ou `POST /sessions/:ref/pair`
 - ✅ Gerenciamento de múltiplas sessões simultâneas
 - ✅ Webhooks para eventos (status, mensagens, chats)
 - ✅ Suporte a mídia (imagens, vídeos, áudio, documentos)
+- ✅ Leitura pura em `GET /sessions/:ref` e `GET /sessions/:ref/status`
+- ✅ Retomada apenas de sessões já registradas
 - ✅ Graceful shutdown com proteção `stopped`
-- ✅ Proteção contra regeneração silenciosa de sessões
 - ✅ Identificação como macOS Desktop para melhor compatibilidade
 
 ## 📋 Variáveis de Ambiente
@@ -23,6 +24,9 @@ BRIDGE_WEBHOOK_SECRET=seu_webhook_secret
 PORT=8080
 BRIDGE_DATA_DIR=/data/sessions
 LOG_LEVEL=warn
+BRIDGE_PAIRING_TTL_MS=150000
+BRIDGE_BUILD=2026-09-02-v4
+BRIDGE_MAX_RESUME=6
 ```
 
 ## 🔧 Endpoints
@@ -41,7 +45,7 @@ curl http://localhost:8080/health
 ```
 
 ### POST /sessions
-Cria uma nova sessão WhatsApp.
+Inicia um pareamento explícito para uma nova sessão WhatsApp.
 
 ```bash
 curl -X POST http://localhost:8080/sessions \
@@ -59,12 +63,24 @@ curl -X POST http://localhost:8080/sessions \
 {
   "sessionRef": "u_user123",
   "pairingCode": "123456",
-  "status": "pairing"
+  "pairingExpiresAt": "2026-09-02T22:00:00.000Z",
+  "status": "pairing",
+  "registered": false,
+  "live": true
 }
 ```
 
 ### GET /sessions/:ref
-Obtém status de uma sessão.
+Obtém status de uma sessão sem criar socket, sem pedir novo código e sem limpar credenciais.
+
+### GET /sessions/:ref/status
+Alias de leitura pura para o mesmo status.
+
+### POST /sessions/:ref/pair
+Gera um novo código de pareamento para uma sessão já conhecida.
+
+### POST /sessions/:ref/resume
+Retoma uma sessão já registrada que não está viva após reinício do processo.
 
 ```bash
 curl http://localhost:8080/sessions/u_user123 \
@@ -157,9 +173,10 @@ BRIDGE_TOKEN=test123 BRIDGE_WEBHOOK_SECRET=secret123 npm start
 ## 📝 Notas
 
 - Sessão salva em `/data/sessions/{sessionRef}/`
-- Graceful shutdown protegido
-- Prote gegen regeneração de código expirado
-- Compatibilidade macOS Desktop
+- `GET /sessions/:ref` e `GET /sessions/:ref/status` são somente leitura
+- Ao subir, o serviço só reconecta sessões já registradas
+- Sessão encerrada no aparelho exige novo pareamento consciente
+- `markOnlineOnConnect = false` e a ponte não envia `readReceipt`
 
 ## 📄 Licença
 
